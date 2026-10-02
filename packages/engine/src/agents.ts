@@ -3,6 +3,7 @@ import { creatureDistance } from './battlecast/engine/combat.js';
 import type { Creature } from './battlecast/types/monster.js';
 import type { LegalAction, LegalActionCatalogue } from './legal-actions.js';
 import type { RandomSource } from './random.js';
+import { lk47Policies, type Lk47Policy } from './lk-47/variants.js';
 
 export type BaselineAgentId =
   | 'baseline.random-legal'
@@ -11,7 +12,8 @@ export type BaselineAgentId =
   | 'baseline.expected-damage';
 export type BattlecastTacticAgentId = `battlecast.${TacticType}`;
 export type OpenRouterAgentId = `openrouter:${string}`;
-export type AgentId = BaselineAgentId | BattlecastTacticAgentId | OpenRouterAgentId;
+export type Lk47AgentId = `lk-47${string}`;
+export type AgentId = BaselineAgentId | BattlecastTacticAgentId | OpenRouterAgentId | Lk47AgentId;
 
 export interface AgentDecisionContext {
   state: BattleState;
@@ -40,7 +42,13 @@ export interface OpenRouterAgent {
   model: string;
 }
 
-export type Agent = LegalActionAgent | BattlecastTacticAgent | OpenRouterAgent;
+export interface Lk47Agent {
+  kind: 'lk-47';
+  id: Lk47AgentId;
+  policy: Lk47Policy;
+}
+
+export type Agent = LegalActionAgent | BattlecastTacticAgent | OpenRouterAgent | Lk47Agent;
 
 export const baselineAgents: Record<BaselineAgentId, LegalActionAgent> = {
   'baseline.random-legal': {
@@ -89,6 +97,9 @@ export function getAgent(agentId: AgentId): Agent {
   if (isOpenRouterAgentId(agentId)) {
     return createOpenRouterAgent(agentId);
   }
+  if (isLk47AgentId(agentId)) {
+    return { kind: 'lk-47', id: agentId, policy: lk47Policies[agentId] };
+  }
   const agent = agents[agentId];
   if (!agent) {
     throw new Error(`unknown agent: ${agentId}`);
@@ -97,7 +108,7 @@ export function getAgent(agentId: AgentId): Agent {
 }
 
 export function isAgentId(value: string): value is AgentId {
-  return value in agents || isOpenRouterAgentId(value);
+  return value in agents || isOpenRouterAgentId(value) || isLk47AgentId(value);
 }
 
 export function listAgentIds(): AgentId[] {
@@ -110,6 +121,10 @@ export function listBattlecastTacticAgentIds(): BattlecastTacticAgentId[] {
 
 export function isOpenRouterAgentId(value: string): value is OpenRouterAgentId {
   return value.startsWith('openrouter:') && value.slice('openrouter:'.length).length > 0;
+}
+
+export function isLk47AgentId(value: string): value is Lk47AgentId {
+  return Object.hasOwn(lk47Policies, value);
 }
 
 export function createOpenRouterAgentId(model: string): OpenRouterAgentId {

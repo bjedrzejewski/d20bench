@@ -54,7 +54,7 @@ import { getEligibleWildShapeBeasts } from './battlecast/data/heroes.js';
 import { maps } from './battlecast/data/maps.js';
 import { buildMovementBlockedSet, buildSightBlockedSet } from './battlecast/types/terrain.js';
 import { createBattlecastCreatures, summarizeBattlecastBattle, type BattlecastBattleSummary } from './battlecast-runner.js';
-import { getAgent, type Agent, type AgentId } from './agents.js';
+import { getAgent, type Agent, type AgentId, type Lk47Agent, type OpenRouterAgent } from './agents.js';
 import {
   createBattlecastTacticAction,
   estimateAttackRollBudget,
@@ -67,6 +67,7 @@ import {
   type LegalActionCatalogue,
 } from './legal-actions.js';
 import { chooseOpenRouterAction, type OpenRouterDecisionTrace, type OpenRouterRawDecisionTrace } from './openrouter-agent.js';
+import type { Lk47Simulator } from './lk-47/variants.js';
 import { createRng, type RandomSeed } from './random.js';
 import { hashBattlecastState, type D20benchScenario } from './scenario.js';
 import type { ReplayEvent, ReplayEventController } from './replay.js';
@@ -142,7 +143,7 @@ export function runAgentMatch(spec: AgentMatchSpec): AgentMatchResult {
               agent,
               replay,
               matchId,
-              autoClassFeatures: !(agent.kind === 'openrouter-llm' && (spec.llmActionSpace ?? 'primitive') === 'actual-actions-v1'),
+              autoClassFeatures: !usesActualActions(agent, spec.llmActionSpace),
               actionSpace: actionSpaceForAgent(agent, spec.llmActionSpace ?? 'primitive'),
             });
         if (!turnStart.canAct) continue;
@@ -229,6 +230,9 @@ export async function runAgentMatchAsync(spec: AgentMatchSpec): Promise<AgentMat
   const matchId = createMatchId(spec);
   const red = getAgent(spec.redAgent);
   const blue = getAgent(spec.blueAgent);
+  if ((red.kind === 'lk-47' || blue.kind === 'lk-47') && spec.llmActionSpace !== 'actual-actions-v1') {
+    throw new Error('lk-47 agents play only with llmActionSpace actual-actions-v1');
+  }
   const agentRng = createRng(`${spec.seed}:agents:${spec.redAgent}:${spec.blueAgent}`);
   const battleRng = createRng(spec.seed);
 
@@ -269,13 +273,13 @@ export async function runAgentMatchAsync(spec: AgentMatchSpec): Promise<AgentMat
               agent,
               replay,
               matchId,
-              autoClassFeatures: !(agent.kind === 'openrouter-llm' && (spec.llmActionSpace ?? 'primitive') === 'actual-actions-v1'),
+              autoClassFeatures: !usesActualActions(agent, spec.llmActionSpace),
               actionSpace: actionSpaceForAgent(agent, spec.llmActionSpace ?? 'primitive'),
             });
         if (!turnStart.canAct) continue;
 
-        if (agent.kind === 'openrouter-llm' && (spec.llmActionSpace ?? 'primitive') === 'actual-actions-v1') {
-          await runStepwiseOpenRouterTurn({
+        if (isStepwiseAgent(agent) && usesActualActions(agent, spec.llmActionSpace)) {
+          await runStepwiseTurn({
             state,
             active,
             agent,
@@ -475,6 +479,13 @@ function describeAgentController(agent: Agent): ReplayEventController {
     };
   }
 
+  if (agent.kind === 'lk-47') {
+    return {
+      mode: 'lk-47',
+      agentId: agent.id,
+    };
+  }
+
   return {
     mode: 'legal-action',
     agentId: agent.id,
@@ -482,8 +493,92 @@ function describeAgentController(agent: Agent): ReplayEventController {
 }
 
 function actionSpaceForAgent(agent: Agent, llmActionSpace: LlmActionSpace): LlmActionSpace {
+  if (agent.kind === 'lk-47') return 'actual-actions-v1';
   return agent.kind === 'openrouter-llm' ? llmActionSpace : 'primitive';
 }
+
+type StepwiseAgent = OpenRouterAgent | Lk47Agent;
+
+interface StepwiseSelection {
+  requestedActionId: string;
+  acceptedAction: LegalAction;
+  trace?: OpenRouterDecisionTrace;
+}
+
+function isStepwiseAgent(agent: Agent): agent is StepwiseAgent {
+  return agent.kind === 'openrouter-llm' || agent.kind === 'lk-47';
+}
+
+function usesActualActions(agent: Agent, llmActionSpace: LlmActionSpace | undefined): boolean {
+  return agent.kind === 'lk-47' || (agent.kind === 'openrouter-llm' && llmActionSpace === 'actual-actions-v1');
+}
+
+// LK-47 receives the state, the active creature and the legal menu, and must pick from the menu, like an LLM.
+async function chooseStepwiseAction(
+  agent: StepwiseAgent,
+  context: Parameters<typeof chooseOpenRouterAction>[1] & { actualTurn?: ActualTurnContext },
+): Promise<StepwiseSelection> {
+  const { actualTurn, ...llmContext } = context;
+  if (agent.kind === 'openrouter-llm') return chooseOpenRouterAction(agent, llmContext);
+  const requested = await agent.policy.chooseAction({
+    state: context.state,
+    activeCreature: context.activeCreature,
+    catalogue: context.catalogue,
+    turn: actualTurn && structuredClone(actualTurn),
+    simulator: lk47Simulator,
+  });
+  const acceptedAction = findLegalAction(context.catalogue, requested.id);
+  if (!acceptedAction) {
+    throw new Error(`${agent.id} chose ${requested.id}, which is not in the legal menu`);
+  }
+  return { requestedActionId: requested.id, acceptedAction };
+}
+
+const simulationControllers: MatchControllers = { red: getAgent('battlecast.smart'), blue: getAgent('battlecast.smart') };
+
+// What LK-47 may do to its private copies of a battle: the rule paths a match uses, with no replay,
+// no prompts, and the scripted bots' default reactions on both sides.
+export const lk47Simulator: Lk47Simulator = {
+  actionsInPlace: (state, active, turn) =>
+    generateLegalActions(state, { ...active, movementRemaining: 0 }, { includeActualActions: true, actualTurnContext: turn }),
+  async applyAction(state, active, action, turn, rng) {
+    const result = await applyActualLegalAction({
+      state,
+      active,
+      action,
+      agent: simulationControllers.red,
+      actualTurn: turn,
+      controllers: simulationControllers,
+      agentRng: rng,
+      battleRng: rng,
+      replay: [],
+      matchId: 'lk-47-simulation',
+      turnStep: 0,
+    });
+    checkBattleComplete(state);
+    return result.ended;
+  },
+  finishTurn(state, active) {
+    finishManualTurnEnd(state, active);
+    checkBattleComplete(state);
+  },
+  playScriptedTurn(state, active, tactic) {
+    applyBattlecastTacticTurn(state, active, tactic);
+    checkBattleComplete(state);
+  },
+  beginTurn(state, active) {
+    const start = processManualAgentTurnStart({
+      state,
+      active,
+      agent: simulationControllers.red,
+      replay: [],
+      matchId: 'lk-47-simulation',
+      autoClassFeatures: false,
+      actionSpace: 'actual-actions-v1',
+    });
+    return start.canAct ? newActualTurn(active) : undefined;
+  },
+};
 
 interface AgentTurnInput {
   state: BattleState;
@@ -512,7 +607,7 @@ interface ManualTurnStartResult {
   turnStartAlreadyProcessed: boolean;
 }
 
-interface ActualTurnContext {
+export interface ActualTurnContext {
   attackRollsRemaining: number;
   attackActionStarted: boolean;
   flurryStrikesRemaining: number;
@@ -536,7 +631,7 @@ interface MatchControllers {
 }
 
 interface PreparedOpportunityReaction {
-  agent: Extract<Agent, { kind: 'openrouter-llm' }>;
+  agent: StepwiseAgent;
   catalogue: LegalActionCatalogue;
   requestedActionId: string;
   acceptedAction: Extract<LegalAction, { type: 'reaction' }>;
@@ -546,11 +641,11 @@ interface PreparedOpportunityReaction {
 type OpportunityReactionMap = Map<string, PreparedOpportunityReaction>;
 
 interface PreparedDamageReaction {
-  agent: Extract<Agent, { kind: 'openrouter-llm' }>;
+  agent: StepwiseAgent;
   catalogue: LegalActionCatalogue;
   requestedActionId: string;
   acceptedAction: Extract<LegalAction, { type: 'reaction' }>;
-  llmTrace: OpenRouterDecisionTrace;
+  llmTrace?: OpenRouterDecisionTrace;
 }
 
 type DamageReactionMap = Map<string, PreparedDamageReaction>;
@@ -558,7 +653,7 @@ type DamageReactionMap = Map<string, PreparedDamageReaction>;
 interface PendingDamageReactionRequest {
   triggerKey: string;
   context: DamageReactionDecisionContext;
-  agent: Extract<Agent, { kind: 'openrouter-llm' }>;
+  agent: StepwiseAgent;
 }
 
 class PendingDamageReactionDecision extends Error {
@@ -653,7 +748,7 @@ function applyAgentTurn(input: AgentTurnInput): AgentTurnResult {
     return { requestedActionId: acceptedAction.id, acceptedAction };
   }
 
-  if (input.agent.kind === 'openrouter-llm') {
+  if (input.agent.kind === 'openrouter-llm' || input.agent.kind === 'lk-47') {
     throw new Error(`${input.agent.id} requires runAgentMatchAsync`);
   }
 
@@ -697,10 +792,20 @@ async function applyAgentTurnAsync(input: AgentTurnInput): Promise<AgentTurnResu
   return applyAgentTurn(input);
 }
 
-async function runStepwiseOpenRouterTurn(input: {
+function newActualTurn(active: Creature): ActualTurnContext {
+  return {
+    attackRollsRemaining: estimateAttackRollBudget(active),
+    attackActionStarted: false,
+    flurryStrikesRemaining: 0,
+    disengaged: false,
+    ended: false,
+  };
+}
+
+async function runStepwiseTurn(input: {
   state: BattleState;
   active: Creature;
-  agent: Extract<Agent, { kind: 'openrouter-llm' }>;
+  agent: StepwiseAgent;
   controllers: MatchControllers;
   agentRng: ReturnType<typeof createRng>;
   battleRng: ReturnType<typeof createRng>;
@@ -709,13 +814,7 @@ async function runStepwiseOpenRouterTurn(input: {
   matchId: string;
   traceSink?: (trace: OpenRouterRawDecisionTrace) => void | Promise<void>;
 }): Promise<void> {
-  const actualTurn: ActualTurnContext = {
-    attackRollsRemaining: estimateAttackRollBudget(input.active),
-    attackActionStarted: false,
-    flurryStrikesRemaining: 0,
-    disengaged: false,
-    ended: false,
-  };
+  const actualTurn = newActualTurn(input.active);
   const maxSteps = 12;
   let step = 0;
 
@@ -783,12 +882,13 @@ async function runStepwiseOpenRouterTurn(input: {
 
     const logsBefore = step === 0 ? input.turnStart.logsBefore : input.state.logs.length;
     const eventsBefore = step === 0 ? input.turnStart.eventsBefore : input.state.events.length;
-    let selection: Awaited<ReturnType<typeof chooseOpenRouterAction>>;
+    let selection: StepwiseSelection;
     try {
-      selection = await chooseOpenRouterAction(input.agent, {
+      selection = await chooseStepwiseAction(input.agent, {
         state: input.state,
         activeCreature: active,
         catalogue,
+        actualTurn,
         rng: input.agentRng,
         traceMeta: {
           matchId: input.matchId,
@@ -989,7 +1089,7 @@ async function chooseOpportunityReactionAtTrigger(input: {
     throw new Error(`Opportunity reaction trigger references missing creatures in ${input.matchId}`);
   }
   const agent = controllerForCreature(reactor, input.controllers);
-  if (agent.kind !== 'openrouter-llm') {
+  if (!isStepwiseAgent(agent)) {
     throw new Error(`Opportunity reaction trigger for non-LLM reactor ${reactor.id} in ${input.matchId}`);
   }
   const decision = await chooseOpportunityReaction({
@@ -1009,7 +1109,7 @@ async function chooseOpportunityReactionAtTrigger(input: {
 }
 
 function declinedOpportunityReaction(
-  agent: Extract<Agent, { kind: 'openrouter-llm' }>,
+  agent: StepwiseAgent,
   reactor: Creature,
   mover: Creature,
   triggerCell: { x: number; y: number },
@@ -1062,7 +1162,7 @@ function createActionCatalogueForAgent(
       }
     : generateLegalActions(state, active, {
         includeBattlecastFullTurnActions: agent.kind === 'openrouter-llm' && llmActionSpace === 'battlecast-full-turn',
-        includeActualActions: agent.kind === 'openrouter-llm' && llmActionSpace === 'actual-actions-v1',
+        includeActualActions: usesActualActions(agent, llmActionSpace),
         actualTurnContext,
       });
 }
@@ -1574,7 +1674,7 @@ async function prepareOpportunityReactionChoicesForMove(
   const decisions: OpportunityReactionMap = new Map();
   for (const trigger of triggers) {
     const agent = controllerForCreature(trigger.reactor, input.controllers);
-    if (agent.kind !== 'openrouter-llm') continue;
+    if (!isStepwiseAgent(agent)) continue;
     const decision = await chooseOpportunityReaction({
       state: input.state,
       reactor: trigger.reactor,
@@ -1621,7 +1721,7 @@ async function chooseDamageReactionAtTrigger(input: {
         incomingDamage: context.incomingDamage,
         damageType: context.damageType,
       });
-  const selection = await chooseOpenRouterAction(agent, {
+  const selection = await chooseStepwiseAction(agent, {
     state: input.state,
     activeCreature: reactor,
     catalogue,
@@ -1653,7 +1753,7 @@ async function chooseOpportunityReaction(input: {
   reactor: Creature;
   mover: Creature;
   triggerCell: { x: number; y: number };
-  agent: Extract<Agent, { kind: 'openrouter-llm' }>;
+  agent: StepwiseAgent;
   agentRng: ReturnType<typeof createRng>;
   matchId: string;
   turnStep?: number;
@@ -1663,9 +1763,9 @@ async function chooseOpportunityReaction(input: {
   input.mover.position = { ...input.triggerCell };
   try {
     const catalogue = generateOpportunityReactionActions(input.reactor, input.mover);
-    let selection: Awaited<ReturnType<typeof chooseOpenRouterAction>>;
+    let selection: StepwiseSelection;
     try {
-      selection = await chooseOpenRouterAction(input.agent, {
+      selection = await chooseStepwiseAction(input.agent, {
         state: input.state,
         activeCreature: input.reactor,
         catalogue,
@@ -1717,7 +1817,7 @@ function createOpportunityAttackHooks(input: {
   return {
     chooseOpportunityAttack: (context) => {
       const controller = controllerForCreature(context.reactor, input.controllers);
-      if (controller.kind !== 'openrouter-llm') return undefined;
+      if (!isStepwiseAgent(controller)) return undefined;
       const decision = input.decisions.get(opportunityReactionKey(context.reactor, context.mover));
       if (!decision) {
         if (input.missingDecision === 'request') {
@@ -1797,7 +1897,7 @@ function createDamageReactionHooks(input: {
     chooseDamageReaction: (context) => {
       const reactor = damageReactionActor(context);
       const controller = controllerForCreature(reactor, input.controllers);
-      if (controller.kind !== 'openrouter-llm') return undefined;
+      if (!isStepwiseAgent(controller)) return undefined;
       const attacker = context.attacker;
       if (!attacker) return 'decline';
       const triggerKey = damageReactionTriggerKey(context, triggerIndex);

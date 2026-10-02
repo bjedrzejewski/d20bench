@@ -23,6 +23,10 @@ export type ReplayEventController =
       mode: 'openrouter-llm';
       agentId: AgentId;
       model: string;
+    }
+  | {
+      mode: 'lk-47';
+      agentId: AgentId;
     };
 
 export type ReplayEvent =
